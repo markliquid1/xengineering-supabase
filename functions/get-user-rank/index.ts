@@ -4,7 +4,7 @@ const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type'
 };
-serve(async (req)=>{
+serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', {
       headers: corsHeaders
@@ -46,7 +46,7 @@ serve(async (req)=>{
         const { data: rawStats, error: statsError } = await supabase.from('device_statistics').select(selectColumns);
         if (statsError) throw statsError;
         // Calculate the derived value
-        stats = rawStats.map((entry)=>{
+        stats = rawStats.map((entry) => {
           let calculatedValue = 0;
           if (column === 'mpg') {
             calculatedValue = entry.total_engine_fuel_gallons > 0 ? entry.total_distance_alltime / entry.total_engine_fuel_gallons : 0;
@@ -60,7 +60,7 @@ serve(async (req)=>{
             total_engine_fuel_gallons: entry.total_engine_fuel_gallons,
             engine_hours: entry.engine_hours
           };
-        }).filter((entry)=>entry[column] > 0).sort((a, b)=>b[column] - a[column]);
+        }).filter((entry) => entry[column] > 0).sort((a, b) => b[column] - a[column]);
       } else {
         // Regular columns
         const { data: regularStats, error: statsError } = await supabase.from('device_statistics').select('device_uid, ' + orderColumn).order(orderColumn, {
@@ -70,30 +70,40 @@ serve(async (req)=>{
         stats = regularStats;
       }
       if (stats && stats.length > 0) {
-        const deviceUids = stats.map((d)=>d.device_uid);
-        const { data: profiles } = await supabase.from('user_profiles').select('device_uid, username, boat_type, boat_length').in('device_uid', deviceUids).eq('profile_public', true);
-        stats.forEach((entry)=>{
-          const profile = profiles?.find((p)=>p.device_uid === entry.device_uid);
+        const deviceUids = stats.map((d) => d.device_uid);
+        const { data: profiles } = await supabase
+          .from('user_profiles')
+          .select('device_uid, username, boat_type, boat_length_ft')
+          .in('device_uid', deviceUids)
+          .eq('profile_public', true);
+        stats.forEach((entry) => {
+          const profile = profiles?.find((p) => p.device_uid === entry.device_uid);
           if (profile) {
             entry.user_profiles = profile;
           }
         });
         // Filter out entries without public profiles
-        allEntries = stats.filter((s)=>s.user_profiles);
+        allEntries = stats.filter((s) => s.user_profiles);
       }
     } else if (type === 'speed') {
       // Speed leaderboards by boat type and size
-      const { data: profiles } = await supabase.from('user_profiles').select('device_uid, username, boat_type, boat_length').eq('boat_type', boat_type).gte('boat_length', min_length || 0).lte('boat_length', max_length || 999).eq('profile_public', true);
+      const { data: profiles } = await supabase
+        .from('user_profiles')
+        .select('device_uid, username, boat_type, boat_length_ft')
+        .eq('boat_type', boat_type)
+        .gte('boat_length_ft', min_length || 0)
+        .lte('boat_length_ft', max_length || 999)
+        .eq('profile_public', true);
       if (!profiles || profiles.length === 0) {
         allEntries = [];
       } else {
-        const deviceUids = profiles.map((p)=>p.device_uid);
+        const deviceUids = profiles.map((p) => p.device_uid);
         const { data: stats } = await supabase.from('device_statistics').select('device_uid, max_speed').in('device_uid', deviceUids).order('max_speed', {
           ascending: false
         });
         if (stats) {
-          stats.forEach((entry)=>{
-            const profile = profiles.find((p)=>p.device_uid === entry.device_uid);
+          stats.forEach((entry) => {
+            const profile = profiles.find((p) => p.device_uid === entry.device_uid);
             if (profile) {
               entry.user_profiles = profile;
             }
@@ -115,7 +125,7 @@ serve(async (req)=>{
       });
     }
     // Find user's rank
-    const userIndex = allEntries.findIndex((entry)=>entry.device_uid === currentDeviceUID);
+    const userIndex = allEntries.findIndex((entry) => entry.device_uid === currentDeviceUID);
     if (userIndex === -1) {
       return new Response(JSON.stringify({
         rank: null,

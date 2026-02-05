@@ -5,7 +5,7 @@ const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type'
 };
-serve(async (req)=>{
+serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', {
       headers: corsHeaders
@@ -31,7 +31,7 @@ serve(async (req)=>{
         const { data: rawStats, error: statsError } = await supabase.from('device_statistics').select(selectColumns);
         if (statsError) throw statsError;
         // Calculate the derived value and filter out invalid entries
-        stats = rawStats.map((entry)=>{
+        stats = rawStats.map((entry) => {
           let calculatedValue = 0;
           if (column === 'mpg') {
             // Miles per gallon = distance / fuel
@@ -47,9 +47,9 @@ serve(async (req)=>{
             total_engine_fuel_gallons: entry.total_engine_fuel_gallons,
             engine_hours: entry.engine_hours
           };
-        }).filter((entry)=>entry[column] > 0) // Remove zero/invalid values
-        .sort((a, b)=>b[column] - a[column]) // Sort descending
-        .slice(0, limit || 10); // Take top N
+        }).filter((entry) => entry[column] > 0) // Remove zero/invalid values
+          .sort((a, b) => b[column] - a[column]) // Sort descending
+          .slice(0, limit || 10); // Take top N
       } else {
         // Regular columns - direct query
         const { data: regularStats, error: statsError } = await supabase.from('device_statistics').select('device_uid, ' + column).order(column, {
@@ -59,11 +59,15 @@ serve(async (req)=>{
         stats = regularStats;
       }
       if (stats && stats.length > 0) {
-        const deviceUids = stats.map((d)=>d.device_uid);
+        const deviceUids = stats.map((d) => d.device_uid);
         if (deviceUids.length > 0) {
-          const { data: profiles } = await supabase.from('user_profiles').select('device_uid, username, boat_type, boat_length').in('device_uid', deviceUids).eq('profile_public', true);
-          stats.forEach((entry)=>{
-            const profile = profiles?.find((p)=>p.device_uid === entry.device_uid);
+          const { data: profiles } = await supabase
+            .from('user_profiles')
+            .select('device_uid, username, boat_type, boat_length_ft')
+            .in('device_uid', deviceUids)
+            .eq('profile_public', true);
+          stats.forEach((entry) => {
+            const profile = profiles?.find((p) => p.device_uid === entry.device_uid);
             if (profile) {
               entry.user_profiles = profile;
             }
@@ -76,12 +80,14 @@ serve(async (req)=>{
       };
     } else if (type === 'speed') {
       // Speed leaderboards by boat type and size
-      let query = supabase.from('user_profiles').select('device_uid, username, boat_type, boat_length').eq('profile_public', true);
-      // Only filter by boat_type if it's not 'all'
+      let query = supabase
+        .from('user_profiles')
+        .select('device_uid, username, boat_type, boat_length_ft')
+        .eq('profile_public', true);      // Only filter by boat_type if it's not 'all'
       if (boat_type && boat_type !== 'all') {
         query = query.eq('boat_type', boat_type);
       }
-      query = query.lte('boat_length', max_length).limit(1000);
+      query = query.lte('boat_length_ft', max_length).limit(1000);
       const { data: profiles } = await query;
       if (!profiles || profiles.length === 0) {
         result = {
@@ -89,13 +95,13 @@ serve(async (req)=>{
           currentDeviceUID
         };
       } else {
-        const deviceUids = profiles.map((p)=>p.device_uid);
+        const deviceUids = profiles.map((p) => p.device_uid);
         const { data: stats } = await supabase.from('device_statistics').select('device_uid, max_speed').in('device_uid', deviceUids).order('max_speed', {
           ascending: false
         }).limit(limit || 5);
         if (stats) {
-          stats.forEach((entry)=>{
-            const profile = profiles.find((p)=>p.device_uid === entry.device_uid);
+          stats.forEach((entry) => {
+            const profile = profiles.find((p) => p.device_uid === entry.device_uid);
             if (profile) {
               entry.user_profiles = profile;
             }
