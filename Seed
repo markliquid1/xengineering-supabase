@@ -1,0 +1,1003 @@
+-- ============================================
+-- FULL RESET AND REBUILD SCRIPT (Run-safe, one file)
+-- aka "seed script" (sometimes called a "bootstrap" or "migration" file).
+-- prepares everything except the massive polygons table (see next tab)
+-- ============================================
+-- ****IMPORTANT: See STEP 0 for selective wipe options****
+-- This script supports 3 scenarios by editing STEP 0 only:
+--   SCENARIO 1: Total reset (nuclear - wipe everything, fresh start)
+--   SCENARIO 2: Rebuild tables but preserve users + sensor_history data
+--   SCENARIO 3: Keep users only, wipe sensor_history data
+-- ============================================
+-- WHAT THIS SCRIPT CHANGES VS PRESERVES
+-- ============================================
+-- NEVER CHANGES (always safe):
+--   - Supabase project URL
+--   - Supabase anon key and service role key
+--   - ESP32 NVS-stored auth tokens
+--   - Supabase dashboard login credentials
+-- ALWAYS REBUILDS (regardless of STEP 0 scenario):
+--   - Stripe tables (orders, order_items, webhook_events)
+--   - Device config snapshots table
+--   - RLS policies (recreated identically)
+--   - Indexes (recreated if not exists)
+--   - SQL functions for fleet statistics
+-- CONDITIONALLY AFFECTS (controlled by STEP 0):
+--   - auth.users (user accounts)
+--   - devices (device registrations and tokens)
+--   - user_profiles (boat/owner information)
+--   - sensor_history (telemetry time-series data)
+--   - device_statistics (leaderboard stats)
+-- ============================================
+-- EXPECTED OUTCOMES BY SCENARIO
+-- ============================================
+-- After SCENARIO 1 (Total Reset):
+--   ✓ Fresh database with empty tables
+--   ✓ All users must re-register
+--   ✓ ESP32 devices must re-register (NVS tokens invalidated)
+--   ✓ All historical sensor data wiped
+--   ✓ Safe to use when schema changes require full rebuild
+-- After SCENARIO 2 (Keep Users + Data):
+--   ✓ Existing users can still log in
+--   ✓ ESP32 devices continue working (tokens still valid)
+--   ✓ Historical sensor data preserved
+--   ✗ Schema changes to preserved tables IGNORED (CREATE IF NOT EXISTS skips)
+--   → Use SCENARIO 1 or manual ALTER TABLE for schema changes
+-- After SCENARIO 3 (Keep Users Only):
+--   ✓ Existing users can still log in
+--   ✓ ESP32 devices continue working (tokens still valid)
+--   ✗ All historical sensor data wiped
+--   ✓ Fresh start on telemetry without losing registrations
+-- ============================================
+-- HANDLING SCHEMA CHANGES (ADD/REMOVE COLUMNS)
+-- ============================================
+-- If you need to modify table schemas:
+-- OPTION A - Full Rebuild (safest, loses data):
+--   1. Use SCENARIO 1 (uncomment all drops in STEP 0)
+--   2. Update CREATE TABLE statements in script
+--   3. Run script → fresh tables with new schema
+--   4. Users must re-register, devices must re-upload buffered data
+-- OPTION B - Alter Without Data Loss:
+--   1. DO NOT use this seed script for schema changes
+--   2. Write manual ALTER TABLE statements:
+--      ALTER TABLE sensor_history ADD COLUMN new_field DOUBLE PRECISION;
+--      ALTER TABLE sensor_history DROP COLUMN old_field;
+--   3. Update CREATE TABLE in seed script to match (for future rebuilds)
+--   4. Run ALTER statements directly in SQL editor
+--   → Existing data preserved, schema updated
+-- LIMITATION: CREATE TABLE IF NOT EXISTS does NOT update existing tables.
+-- If table exists, any schema changes in the CREATE statement are ignored.
+-- ============================================
+-- SECURITY ARCHITECTURE =
+-- ============================================
+-- SECURITY MODEL: Zero direct database access from browsers
+-- 
+-- How it works:
+--   1. All tables have RLS enabled
+--   2. No RLS policies exist (or explicitly block anon/authenticated roles)
+--   3. Anon key cannot query ANY table directly
+--   4. ALL queries go through Edge Functions using SERVICE_ROLE key
+--   5. SERVICE_ROLE bypasses RLS (Supabase built-in behavior)
+--
+-- This means:
+--   ✓ Anon key in browser is harmless (cannot query tables)
+--   ✓ All access control enforced server-side in Edge Functions
+--   ✓ Edge Functions validate tokens before returning data
+--   ✓ No way for attackers to bypass filtering
+-- DATA FLOW:
+--   ESP32 → Edge Function (SERVICE_ROLE) → Database
+--   Browser → Edge Function (SERVICE_ROLE) → Database
+--   
+-- NOT:
+--   Browser → Database (anon key) ← BLOCKED BY RLS
+-- VERIFICATION:
+-- Try this in browser console with anon key:
+--   supabase.from('sensor_history').select('*')
+-- Result: Error (no policy allows anon access)
+-- PRIVACY COMPLIANCE:
+-- User deletion via auth.admin.deleteUser() triggers CASCADE cleanup:
+--   auth.users → user_profiles, devices → sensor_history, device_statistics, device_config_snapshots
+-- All personal data removed, only anonymized fleet stats remain.
+-- ============================================
+-- IMPORTANT: STEP 0 IS THE ONLY CONTROL POINT
+-- ============================================
+-- DO NOT edit DROP/CREATE statements elsewhere in this file.
+-- ALL scenario control happens in STEP 0 below.
+-- The rest of the script executes unconditionally after STEP 0.
+-- ============================================
+-- ============================================
+-- STEP 0: CONTROLLED WIPE (edit this block for different reset scenarios)
+-- ============================================
+-- 
+-- SCENARIO 1 - TOTAL RESET (nuclear option):
+--   Uncomment ALL lines below
+-- 
+-- SCENARIO 2 - KEEP USERS + SENSOR DATA (rebuild everything else):
+--   Keep lines 24-26 commented out
+--   Uncomment lines 15-22
+-- 
+-- SCENARIO 3 - KEEP USERS ONLY (wipe sensor data):
+--   Keep line 26 commented out (auth.users)
+--   Uncomment lines 15-25
+-- ============================================
+-- Tables that always get rebuilt (orders, webhooks, snapshots)
+drop table if exists public.device_config_snapshots CASCADE;
+
+drop table if exists public.order_items CASCADE;
+
+drop table if exists public.orders CASCADE;
+
+drop table if exists public.stripe_webhook_events CASCADE;
+
+-- Sensor data (comment out to preserve historical data)
+drop table if exists public.sensor_history CASCADE;
+
+-- SCENARIO 2: Comment this line
+delete from public.device_statistics;
+
+-- SCENARIO 2: Comment these lines
+-- User data and device registrations (comment out to preserve users)
+drop table if exists public.user_profiles CASCADE;
+drop table if exists public.devices CASCADE;
+drop table if exists public.device_statistics CASCADE;
+
+-- SCENARIO 2: Comment this line
+delete from auth.users;
+
+-- SCENARIO 2 & 3: Comment this line
+-- ============================================
+-- STEP 1: Ensure required extension
+create extension IF not exists "uuid-ossp";
+
+-- ============================================
+-- STEP 2: Recreate core tables
+create table if not exists public.devices (
+  device_uid TEXT primary key,
+  auth_token UUID default uuid_generate_v4 () unique not null,
+  current_fw_version_int INTEGER,
+  forced_fw_version TEXT,
+  forced_update_deadline TIMESTAMPTZ,
+  created_at TIMESTAMPTZ default NOW(),
+  last_seen TIMESTAMPTZ default NOW()
+);
+
+create table if not exists public.user_profiles (
+  device_uid TEXT primary key references public.devices (device_uid) on delete CASCADE,
+  username TEXT unique not null,
+  email TEXT not null, -- Contact info, not for auth
+  boat_type TEXT not null,
+  boat_length INTEGER not null,
+  boat_make_model TEXT not null,
+  boat_year INTEGER not null,
+  home_port TEXT not null,
+  battery_voltage INTEGER not null,
+  battery_capacity INTEGER not null,
+  battery_type TEXT not null,
+  alternator TEXT,
+  solar_watts INTEGER,
+  engine_make TEXT,
+  engine_hp INTEGER,
+  profile_public BOOLEAN default true,
+  profile_complete BOOLEAN default false,
+  created_at TIMESTAMPTZ default NOW(),
+  updated_at TIMESTAMPTZ default NOW()
+);
+
+create table if not exists public.device_statistics (
+  device_uid TEXT primary key references public.devices (device_uid) on delete CASCADE,
+  alt_kwh DECIMAL(10, 2) default 0,
+  alt_kwh_alltime DECIMAL(10, 2) default 0,
+  solar_kwh DECIMAL(10, 2) default 0,
+  solar_kwh_alltime DECIMAL(10, 2) default 0,
+  charged_energy_alltime DECIMAL(10, 2) default 0,
+  discharged_energy_alltime DECIMAL(10, 2) default 0,
+  total_distance DECIMAL(10, 2) default 0,
+  total_distance_alltime DECIMAL(10, 2) default 0,
+  max_speed DECIMAL(10, 2) default 0,
+  max_alt_amps DECIMAL(10, 2) default 0,
+  peak_voltage DECIMAL(10, 2) default 0,
+  engine_hours DECIMAL(10, 2) default 0,
+  alternator_on_hours DECIMAL(10, 2) default 0,
+  charge_cycles INTEGER default 0,
+  current_soc DECIMAL(5, 2) default 0,
+  total_engine_fuel_gallons DOUBLE PRECISION default 0,
+  total_alternator_fuel_gallons DOUBLE PRECISION default 0,
+  days_at_sea_alltime INTEGER default 0,
+  current_streak_days INTEGER default 0,
+  longest_streak_days INTEGER default 0,
+  last_position_check_date DATE,
+  sailing_days_alltime REAL default 0,
+  sailing_ratio REAL default 0,
+  max_wind_speed_true_alltime REAL default 0,
+  max_wind_speed_apparent_alltime REAL default 0,
+  board_temp_max_alltime REAL default -999,
+  board_temp_min_alltime REAL default 999,
+  baro_pressure_max_alltime REAL default 0,
+  baro_pressure_min_alltime REAL default 9999,
+  consecutive_days_moving INTEGER default 0,
+  longest_consecutive_days_moving INTEGER default 0,
+  last_updated TIMESTAMPTZ default NOW(),
+  -- Time-weighted aggregates for fast fleet statistics
+  lifetime_soc_weighted_sum DOUBLE PRECISION default 0,
+  lifetime_soc_sample_time BIGINT default 0,
+  lifetime_voltage_weighted_sum DOUBLE PRECISION default 0,
+  lifetime_voltage_sample_time BIGINT default 0,
+  lifetime_speed_weighted_sum DOUBLE PRECISION default 0,
+  lifetime_speed_sample_time BIGINT default 0
+);
+
+-- Stripe orders table (one per checkout session)
+create table if not exists public.orders (
+  id BIGSERIAL primary key,
+  stripe_payment_intent_id TEXT unique not null,
+  stripe_customer_id TEXT,
+  stripe_customer_email TEXT not null,
+  stripe_customer_name TEXT,
+  amount_total INTEGER not null,
+  currency TEXT default 'usd',
+  order_date TIMESTAMPTZ default NOW(),
+  shipping_address JSONB,
+  refunded BOOLEAN default false,
+  refund_date TIMESTAMPTZ,
+  refund_reason TEXT,
+  internal_notes TEXT
+);
+
+-- Order items table (one per device in the order)
+create table if not exists public.order_items (
+  id BIGSERIAL primary key,
+  order_id BIGINT references public.orders (id) on delete CASCADE,
+  stripe_line_item_id TEXT,
+  product_name TEXT not null,
+  stripe_product_id TEXT,
+  device_uid TEXT unique references public.devices (device_uid) on delete set null,
+  registered_user_email TEXT,
+  device_shipped_date TIMESTAMPTZ,
+  device_claimed BOOLEAN default false,
+  device_claimed_at TIMESTAMPTZ
+);
+
+-- Webhook event log for debugging and idempotency
+create table if not exists public.stripe_webhook_events (
+  id BIGSERIAL primary key,
+  event_id TEXT unique not null,
+  event_type TEXT not null,
+  received_at TIMESTAMPTZ default NOW(),
+  payload JSONB,
+  processed BOOLEAN default false,
+  error_message TEXT
+);
+
+-- Device config snapshots table with explicit columns for fast querying
+create table if not exists public.device_config_snapshots (
+  id BIGSERIAL primary key,
+  device_uid TEXT not null references public.devices (device_uid) on delete CASCADE,
+  snapshot_timestamp TIMESTAMPTZ not null default NOW(),
+  unix_time BIGINT,
+  -- System Health
+  current_partition_type INTEGER,
+  firmware_version_int INTEGER,
+  raw_free_heap INTEGER,
+  min_free_heap INTEGER,
+  free_internal_ram INTEGER,
+  heapfrag INTEGER,
+  cpu_load_core0 INTEGER,
+  cpu_load_core1 INTEGER,
+  cpu_load_core0_max INTEGER,
+  cpu_load_core1_max INTEGER,
+  loop_time INTEGER,
+  max_loop_time INTEGER,
+  wifi_strength INTEGER,
+  wifi_reconnects_total INTEGER,
+  wifi_disconnect_count INTEGER,
+  -- Session Stats
+  last_session_duration BIGINT,
+  last_session_max_loop_time INTEGER,
+  last_session_min_heap INTEGER,
+  last_reset_reason INTEGER,
+  ancient_reset_reason INTEGER,
+  total_power_cycles INTEGER,
+  -- Weather/Solar
+  solar_watts INTEGER,
+  performance_ratio REAL,
+  weather_mode_enabled INTEGER,
+  current_weather_mode INTEGER,
+  -- Charge Settings
+  float_voltage REAL,
+  bulk_voltage REAL,
+  bulk_complete_time BIGINT,
+  float_duration BIGINT,
+  temperature_limit_f REAL,
+  force_float INTEGER,
+  -- Control Switches
+  on_off INTEGER,
+  ignition INTEGER,
+  ignition_override INTEGER,
+  hi_low INTEGER,
+  amp_src INTEGER,
+  -- Field Control
+  duty_step REAL,
+  switching_frequency REAL,
+  max_duty REAL,
+  min_duty REAL,
+  manual_duty_target INTEGER,
+  freq INTEGER,
+  -- Hardware Specs
+  field_resistance REAL,
+  r_fixed REAL,
+  beta REAL,
+  t0_c REAL,
+  temp_source INTEGER,
+  current_time_source INTEGER,
+  -- Sensor Config
+  sensor_upload_interval BIGINT,
+  buffered_record_count INTEGER,
+  battery_capacity_ah INTEGER,
+  peukert_rated_current_a REAL,
+  soc_update_interval INTEGER,
+  fuel_efficiency_scaled INTEGER,
+  battery_voltage_source INTEGER,
+  battery_current_source INTEGER,
+  -- Learning System Settings
+  learning_mode INTEGER,
+  learning_paused INTEGER,
+  learning_upward_enabled INTEGER,
+  learning_downward_enabled INTEGER,
+  alternator_nominal_amps INTEGER,
+  learning_up_step REAL,
+  learning_down_step REAL,
+  ambient_temp_correction_factor REAL,
+  ambient_temp_baseline REAL,
+  min_learning_interval BIGINT,
+  safe_operation_threshold BIGINT,
+  last_significant_rpm_change BIGINT,
+  last_stable_rpm INTEGER,
+  learning_settling_period INTEGER,
+  learning_rpm_change_threshold INTEGER,
+  learning_temp_hysteresis INTEGER,
+  -- PID Tuning
+  pid_kp REAL,
+  pid_ki REAL,
+  pid_kd REAL,
+  pid_sample_time BIGINT,
+  max_penalty_percent REAL,
+  max_penalty_duration BIGINT,
+  -- Learning Diagnostics
+  neighbor_learning_factor REAL,
+  learning_rpm_spacing INTEGER,
+  learning_memory_duration BIGINT,
+  ignore_learning_during_penalty INTEGER,
+  enable_neighbor_learning INTEGER,
+  enable_ambient_correction INTEGER,
+  learning_failsafe_mode INTEGER,
+  learning_dry_run_mode INTEGER,
+  auto_save_learning_table INTEGER,
+  learning_table_save_interval BIGINT,
+  clear_overheat_history INTEGER,
+  overheating_penalty_timer BIGINT,
+  overheating_penalty_amps REAL,
+  total_learning_events BIGINT,
+  total_overheats BIGINT,
+  total_safe_hours BIGINT,
+  average_table_value REAL,
+  -- SOC Algorithm
+  auto_shunt_gain_correction INTEGER,
+  dynamic_shunt_gain_factor REAL,
+  auto_alt_current_zero INTEGER,
+  dynamic_alt_current_zero REAL,
+  current_threshold INTEGER,
+  peukert_exponent_scaled INTEGER,
+  charge_efficiency_scaled INTEGER,
+  charged_voltage_scaled INTEGER,
+  tail_current INTEGER,
+  shunt_resistance_micro_ohm INTEGER,
+  charged_detection_time INTEGER,
+  ignore_temperature INTEGER,
+  -- BMS Integration
+  bms_logic INTEGER,
+  bms_logic_level_off INTEGER,
+  -- Alarm Settings
+  alarm_activate INTEGER,
+  temp_alarm INTEGER,
+  voltage_alarm_high INTEGER,
+  voltage_alarm_low INTEGER,
+  current_alarm_high INTEGER,
+  maximum_allowed_battery_amps INTEGER,
+  -- Calibration
+  four_way INTEGER,
+  rpm_scaling_factor INTEGER,
+  alternator_c_offset REAL,
+  battery_c_offset REAL,
+  time_to_full_charge_min INTEGER,
+  time_to_full_discharge_min INTEGER,
+  -- Engine Tracking
+  engine_run_accumulator BIGINT,
+  alternator_on_accumulator BIGINT,
+  -- Temperature Sensor
+  winding_temp_offset REAL,
+  pulley_ratio REAL,
+  -- Thermal Stress
+  cumulative_insulation_damage REAL,
+  cumulative_grease_damage REAL,
+  cumulative_brush_damage REAL,
+  insulation_life_percent REAL,
+  grease_life_percent REAL,
+  brush_life_percent REAL,
+  predicted_life_hours REAL,
+  life_indicator_color INTEGER,
+  -- Timing Config
+  maximum_loop_time INTEGER,
+  rpm_threshold INTEGER,
+  ve_time INTEGER,
+  send_wifi_time INTEGER,
+  analog_read_time INTEGER,
+  analog_read_time2 INTEGER,
+  web_gauges_interval BIGINT,
+  plot_time_window INTEGER,
+  healthystuff_interval BIGINT,
+  -- Authentication
+  is_registered BOOLEAN,
+  learning_table_updated BOOLEAN,
+  charging_enabled BOOLEAN,
+  bms_signal_active BOOLEAN,
+  -- RPM Current Table (10 values)
+  rpm_current_table_0 REAL,
+  rpm_current_table_1 REAL,
+  rpm_current_table_2 REAL,
+  rpm_current_table_3 REAL,
+  rpm_current_table_4 REAL,
+  rpm_current_table_5 REAL,
+  rpm_current_table_6 REAL,
+  rpm_current_table_7 REAL,
+  rpm_current_table_8 REAL,
+  rpm_current_table_9 REAL,
+  -- RPM Table Points (10 values)
+  rpm_table_rpm_points_0 INTEGER,
+  rpm_table_rpm_points_1 INTEGER,
+  rpm_table_rpm_points_2 INTEGER,
+  rpm_table_rpm_points_3 INTEGER,
+  rpm_table_rpm_points_4 INTEGER,
+  rpm_table_rpm_points_5 INTEGER,
+  rpm_table_rpm_points_6 INTEGER,
+  rpm_table_rpm_points_7 INTEGER,
+  rpm_table_rpm_points_8 INTEGER,
+  rpm_table_rpm_points_9 INTEGER,
+  -- Overheat Count (10 values)
+  overheat_count_0 INTEGER,
+  overheat_count_1 INTEGER,
+  overheat_count_2 INTEGER,
+  overheat_count_3 INTEGER,
+  overheat_count_4 INTEGER,
+  overheat_count_5 INTEGER,
+  overheat_count_6 INTEGER,
+  overheat_count_7 INTEGER,
+  overheat_count_8 INTEGER,
+  overheat_count_9 INTEGER,
+  -- Last Overheat Time (10 values)
+  last_overheat_time_0 BIGINT,
+  last_overheat_time_1 BIGINT,
+  last_overheat_time_2 BIGINT,
+  last_overheat_time_3 BIGINT,
+  last_overheat_time_4 BIGINT,
+  last_overheat_time_5 BIGINT,
+  last_overheat_time_6 BIGINT,
+  last_overheat_time_7 BIGINT,
+  last_overheat_time_8 BIGINT,
+  last_overheat_time_9 BIGINT,
+  -- Cumulative No Overheat Time (10 values)
+  cumulative_no_overheat_time_0 BIGINT,
+  cumulative_no_overheat_time_1 BIGINT,
+  cumulative_no_overheat_time_2 BIGINT,
+  cumulative_no_overheat_time_3 BIGINT,
+  cumulative_no_overheat_time_4 BIGINT,
+  cumulative_no_overheat_time_5 BIGINT,
+  cumulative_no_overheat_time_6 BIGINT,
+  cumulative_no_overheat_time_7 BIGINT,
+  cumulative_no_overheat_time_8 BIGINT,
+  cumulative_no_overheat_time_9 BIGINT,
+  created_at TIMESTAMPTZ default NOW()
+);
+
+-- Sensor history table - schema defined here, DROP controlled in STEP 0
+create table if not exists public.sensor_history (
+  id BIGSERIAL primary key,
+  device_uid TEXT not null references public.devices (device_uid) on delete CASCADE,
+  timestamp TIMESTAMPTZ not null default NOW(),
+  -- Battery metrics
+  batt_volt_min DOUBLE PRECISION,
+  batt_volt_max DOUBLE PRECISION,
+  batt_volt_avg DOUBLE PRECISION,
+  batt_curr_min DOUBLE PRECISION,
+  batt_curr_max DOUBLE PRECISION,
+  batt_curr_avg DOUBLE PRECISION,
+  -- Alternator metrics
+  alt_curr_min DOUBLE PRECISION,
+  alt_curr_max DOUBLE PRECISION,
+  alt_curr_avg DOUBLE PRECISION,
+  -- Victron current
+  victron_curr_min DOUBLE PRECISION,
+  victron_curr_max DOUBLE PRECISION,
+  victron_curr_avg DOUBLE PRECISION,
+  -- State of charge
+  soc_min DOUBLE PRECISION,
+  soc_max DOUBLE PRECISION,
+  soc_avg DOUBLE PRECISION,
+  -- Environmental
+  baro_min DOUBLE PRECISION,
+  baro_max DOUBLE PRECISION,
+  baro_avg DOUBLE PRECISION,
+  alt_temp_min DOUBLE PRECISION,
+  alt_temp_max DOUBLE PRECISION,
+  alt_temp_avg DOUBLE PRECISION,
+  temp_therm_min DOUBLE PRECISION,
+  temp_therm_max DOUBLE PRECISION,
+  temp_therm_avg DOUBLE PRECISION,
+  amb_temp_min DOUBLE PRECISION,
+  amb_temp_max DOUBLE PRECISION,
+  amb_temp_avg DOUBLE PRECISION,
+  -- Motion
+  rpm_min DOUBLE PRECISION,
+  rpm_max DOUBLE PRECISION,
+  rpm_avg DOUBLE PRECISION,
+  speed_min DOUBLE PRECISION,
+  speed_max DOUBLE PRECISION,
+  speed_avg DOUBLE PRECISION,
+  -- Energy (reserved, not currently written)
+  kwh_min DOUBLE PRECISION,
+  kwh_max DOUBLE PRECISION,
+  kwh_avg DOUBLE PRECISION,
+  -- WiFi strength
+  wifi_str_min DOUBLE PRECISION,
+  wifi_str_max DOUBLE PRECISION,
+  wifi_str_avg DOUBLE PRECISION,
+  -- Duty cycle window
+  duty_cycle_min DOUBLE PRECISION,
+  duty_cycle_max DOUBLE PRECISION,
+  duty_cycle_avg DOUBLE PRECISION,
+  -- Alternator zero offset
+  alt_zero_min DOUBLE PRECISION,
+  alt_zero_max DOUBLE PRECISION,
+  alt_zero_avg DOUBLE PRECISION,
+  -- GPS and heading
+  sog_min DOUBLE PRECISION,
+  sog_max DOUBLE PRECISION,
+  sog_avg DOUBLE PRECISION,
+  cog_min DOUBLE PRECISION,
+  cog_max DOUBLE PRECISION,
+  cog_avg DOUBLE PRECISION,
+  heading_min DOUBLE PRECISION,
+  heading_max DOUBLE PRECISION,
+  heading_avg DOUBLE PRECISION,
+  lat_avg DOUBLE PRECISION,
+  lon_avg DOUBLE PRECISION,
+  -- Wind and leeway
+  aws_min DOUBLE PRECISION,
+  aws_max DOUBLE PRECISION,
+  aws_avg DOUBLE PRECISION,
+  awa_min DOUBLE PRECISION,
+  awa_max DOUBLE PRECISION,
+  awa_avg DOUBLE PRECISION,
+  tws_min DOUBLE PRECISION,
+  tws_max DOUBLE PRECISION,
+  tws_avg DOUBLE PRECISION,
+  twa_min DOUBLE PRECISION,
+  twa_max DOUBLE PRECISION,
+  twa_avg DOUBLE PRECISION,
+  leeway_min DOUBLE PRECISION,
+  leeway_max DOUBLE PRECISION,
+  leeway_avg DOUBLE PRECISION,
+  vmg_min DOUBLE PRECISION,
+  vmg_max DOUBLE PRECISION,
+  vmg_avg DOUBLE PRECISION,
+  -- Cumulative metrics
+  eng_hrs DOUBLE PRECISION,
+  alt_hrs DOUBLE PRECISION, -- ADD THIS LINE
+  eng_cycles INTEGER,
+  eng_fuel DOUBLE PRECISION,
+  alt_fuel DOUBLE PRECISION,
+  charge_cycles INTEGER,
+  total_dist DOUBLE PRECISION,
+  -- Intended upload interval in SECONDS (float) as reported by the device
+  intended_interval_sec DOUBLE PRECISION,
+  -- Learning system performance metrics
+  u_target_amps_min DOUBLE PRECISION,
+  u_target_amps_max DOUBLE PRECISION,
+  u_target_amps_avg DOUBLE PRECISION,
+  temp_margin_min DOUBLE PRECISION,
+  temp_margin_max DOUBLE PRECISION,
+  temp_margin_avg DOUBLE PRECISION,
+  total_overheats INTEGER,
+  total_safe_hours DOUBLE PRECISION,
+  buffered_uploads_remaining INTEGER default 0
+);
+
+-- ============================================
+-- STEP 3: Enable RLS where needed
+alter table public.devices ENABLE row LEVEL SECURITY;
+
+alter table public.user_profiles ENABLE row LEVEL SECURITY;
+
+alter table public.device_statistics ENABLE row LEVEL SECURITY;
+
+alter table public.sensor_history ENABLE row LEVEL SECURITY;
+
+alter table public.orders ENABLE row LEVEL SECURITY;
+
+alter table public.order_items ENABLE row LEVEL SECURITY;
+
+alter table public.stripe_webhook_events ENABLE row LEVEL SECURITY;
+
+alter table public.device_config_snapshots ENABLE row LEVEL SECURITY;
+
+-- ============================================
+-- ============================================
+-- STEP 4: RLS Policies (ALL ACCESS VIA SERVICE_ROLE EDGE FUNCTIONS)
+-- ============================================
+-- 
+-- SECURITY MODEL: All queries must go through Edge Functions using SERVICE_ROLE key.
+-- Anon key cannot query tables directly - all policies block anon role.
+-- Edge Functions bypass RLS when using SERVICE_ROLE key.
+--
+-- ============================================
+-- Devices table policies
+drop policy IF exists "Service role can insert devices" on public.devices;
+
+drop policy IF exists "Anyone can read devices for token validation" on public.devices;
+
+drop policy IF exists "Service role can update devices" on public.devices;
+
+-- No policies = no anon access. Only service_role (which bypasses RLS) can access.
+-- User profiles policies
+drop policy IF exists "Service role can insert profiles" on public.user_profiles;
+
+drop policy IF exists "Public can view profiles" on public.user_profiles;
+
+drop policy IF exists "Service role can update profiles" on public.user_profiles;
+
+-- No policies = Edge Functions only
+-- Device statistics policies
+drop policy IF exists "Public can view device statistics" on public.device_statistics;
+
+drop policy IF exists "Anyone can update device statistics" on public.device_statistics;
+
+drop policy IF exists "Anyone can insert device statistics" on public.device_statistics;
+
+-- No policies = Edge Functions only
+-- Sensor history policies - BLOCK ALL ANON ACCESS
+drop policy IF exists "Users can read own sensor history" on public.sensor_history;
+
+drop policy IF exists "Service role can insert sensor history" on public.sensor_history;
+
+-- Explicitly block anon (though no policy = blocked anyway)
+create policy "Block anon access to sensor history" on public.sensor_history for all using (false);
+
+-- Orders table policies
+drop policy IF exists "Service role can insert orders" on public.orders;
+
+drop policy IF exists "Service role can read orders" on public.orders;
+
+drop policy IF exists "Service role can update orders" on public.orders;
+
+-- No policies = Edge Functions only
+-- Order items table policies
+drop policy IF exists "Service role can insert order items" on public.order_items;
+
+drop policy IF exists "Service role can read order items" on public.order_items;
+
+drop policy IF exists "Service role can update order items" on public.order_items;
+
+-- No policies = Edge Functions only
+-- Webhook events table policies
+drop policy IF exists "Service role can manage webhook events" on public.stripe_webhook_events;
+
+-- No policies = Edge Functions only
+-- Config snapshots policies
+drop policy IF exists "Service role can insert config snapshots" on public.device_config_snapshots;
+
+drop policy IF exists "Users can read own config snapshots" on public.device_config_snapshots;
+
+drop policy IF exists "Service role can read config snapshots" on public.device_config_snapshots;
+
+-- No policies = Edge Functions only
+-- ============================================
+-- STEP 5: Indexes
+
+create index IF not exists idx_devices_auth_token on public.devices (auth_token);
+
+create index IF not exists idx_device_stats_alt_kwh on public.device_statistics (alt_kwh_alltime desc);
+
+create index IF not exists idx_device_stats_solar_kwh on public.device_statistics (solar_kwh_alltime desc);
+
+create index IF not exists idx_device_stats_max_speed on public.device_statistics (max_speed desc);
+
+create index IF not exists idx_device_stats_last_updated on public.device_statistics (last_updated desc);
+
+create index IF not exists sensor_history_device_time_idx on public.sensor_history (device_uid, timestamp desc);
+
+create index IF not exists sensor_history_timestamp_idx on public.sensor_history (timestamp desc);
+
+create index IF not exists idx_orders_payment_intent on public.orders (stripe_payment_intent_id);
+
+create index IF not exists idx_orders_email on public.orders (stripe_customer_email);
+
+create index IF not exists idx_orders_date on public.orders (order_date desc);
+
+create index IF not exists idx_order_items_order_id on public.order_items (order_id);
+
+create index IF not exists idx_order_items_device_uid on public.order_items (device_uid);
+
+create index IF not exists idx_order_items_unclaimed on public.order_items (device_uid)
+where
+  device_uid is null;
+
+create index IF not exists idx_webhook_events_event_id on public.stripe_webhook_events (event_id);
+
+create index IF not exists idx_webhook_events_type on public.stripe_webhook_events (event_type);
+
+create index IF not exists idx_webhook_events_processed on public.stripe_webhook_events (processed)
+where
+  processed = false;
+
+create index IF not exists idx_config_snapshots_device_time on public.device_config_snapshots (device_uid, snapshot_timestamp desc);
+
+create index IF not exists idx_config_snapshots_firmware on public.device_config_snapshots (firmware_version_int);
+
+create index IF not exists idx_config_snapshots_created on public.device_config_snapshots (created_at desc);
+
+create index IF not exists idx_devices_fw_version on public.devices (current_fw_version_int);
+
+-- Speed leaderboard boat filtering optimization
+create index IF not exists idx_user_profiles_boat_filters on public.user_profiles (boat_type, boat_length);
+
+create index IF not exists idx_devices_forced_update on public.devices (forced_fw_version)
+where
+  forced_fw_version is not null;
+
+create index IF not exists idx_device_stats_days_at_sea on public.device_statistics (days_at_sea_alltime desc);
+
+create index IF not exists idx_device_stats_current_streak on public.device_statistics (current_streak_days desc);
+
+create index IF not exists idx_device_stats_longest_streak on public.device_statistics (longest_streak_days desc);
+
+create index IF not exists idx_device_stats_check_date on public.device_statistics (device_uid, last_position_check_date);
+
+-- ============================================
+-- STEP 6: SQL Functions for Fleet Statistics
+create or replace function public.avg_battery_voltage () RETURNS DOUBLE PRECISION as $$
+  SELECT 
+    SUM(lifetime_voltage_weighted_sum) / NULLIF(SUM(lifetime_voltage_sample_time), 0)
+  FROM public.device_statistics
+  WHERE lifetime_voltage_sample_time > 0;
+$$ LANGUAGE SQL STABLE;
+
+create or replace function public.avg_battery_soc () RETURNS DOUBLE PRECISION as $$
+  SELECT 
+    SUM(lifetime_soc_weighted_sum) / NULLIF(SUM(lifetime_soc_sample_time), 0)
+  FROM public.device_statistics
+  WHERE lifetime_soc_sample_time > 0;
+$$ LANGUAGE SQL STABLE;
+
+-- Total distance traveled across all devices (from device_statistics)
+create or replace function public.total_distance () RETURNS DOUBLE PRECISION as $$
+  SELECT COALESCE(SUM(total_distance_alltime), 0)
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+-- Replace slow avg_speed() with fast version
+create or replace function public.avg_speed () RETURNS DOUBLE PRECISION as $$
+  SELECT 
+    SUM(lifetime_speed_weighted_sum) / NULLIF(SUM(lifetime_speed_sample_time), 0)
+  FROM public.device_statistics
+  WHERE lifetime_speed_sample_time > 0;
+$$ LANGUAGE SQL STABLE;
+
+-- Total alternator energy output (convert kWh to Wh)
+create or replace function public.total_alt_energy () RETURNS DOUBLE PRECISION as $$
+  SELECT COALESCE(SUM(alt_kwh_alltime), 0) * 1000
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+-- Total solar energy produced (convert kWh to Wh)
+create or replace function public.total_solar_energy () RETURNS DOUBLE PRECISION as $$
+  SELECT COALESCE(SUM(solar_kwh_alltime), 0) * 1000
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+-- Total engine hours across all devices
+create or replace function public.total_engine_hours () RETURNS DOUBLE PRECISION as $$
+  SELECT COALESCE(SUM(engine_hours), 0)
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+-- Total engine fuel consumed (get latest cumulative value per device)
+create or replace function public.total_engine_fuel () RETURNS DOUBLE PRECISION as $$
+  WITH latest_per_device AS (
+    SELECT DISTINCT ON (device_uid) 
+      device_uid,
+      eng_fuel
+    FROM public.sensor_history
+    WHERE eng_fuel IS NOT NULL
+    ORDER BY device_uid, timestamp DESC
+  )
+  SELECT COALESCE(SUM(eng_fuel), 0)
+  FROM latest_per_device;
+$$ LANGUAGE SQL STABLE;
+
+-- Total alternator fuel consumed (get latest cumulative value per device)
+create or replace function public.total_alt_fuel () RETURNS DOUBLE PRECISION as $$
+  WITH latest_per_device AS (
+    SELECT DISTINCT ON (device_uid) 
+      device_uid,
+      alt_fuel
+    FROM public.sensor_history
+    WHERE alt_fuel IS NOT NULL
+    ORDER BY device_uid, timestamp DESC
+  )
+  SELECT COALESCE(SUM(alt_fuel), 0)
+  FROM latest_per_device;
+$$ LANGUAGE SQL STABLE;
+
+-- Total battery charged energy (placeholder - needs proper calculation)
+create or replace function public.total_battery_charged () RETURNS DOUBLE PRECISION as $$
+  SELECT 0.0;
+$$ LANGUAGE SQL STABLE;
+
+-- Total discharged energy (placeholder - needs proper calculation)
+create or replace function public.total_discharged () RETURNS DOUBLE PRECISION as $$
+  SELECT 0.0;
+$$ LANGUAGE SQL STABLE;
+
+-- Function to check if a position is at sea (>0.5 miles from land)
+create or replace function public.is_at_sea (
+  longitude DOUBLE PRECISION,
+  latitude DOUBLE PRECISION,
+  threshold_miles DOUBLE PRECISION default 0.5
+) RETURNS BOOLEAN as $$
+DECLARE
+  distance_meters DOUBLE PRECISION;
+  threshold_meters DOUBLE PRECISION;
+BEGIN
+  threshold_meters := threshold_miles * 1609.34;
+  
+  -- Find distance to nearest land using spatial index
+  SELECT ST_Distance(
+    ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography,
+    geom::geography
+  ) INTO distance_meters
+  FROM land_polygons
+  ORDER BY geom <-> ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+  LIMIT 1;
+  
+  -- If no land found (shouldn't happen with global data), assume at sea
+  IF distance_meters IS NULL THEN
+    RETURN TRUE;
+  END IF;
+  
+  RETURN distance_meters > threshold_meters;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT on FUNCTION public.is_at_sea is 'Returns true if coordinates are more than threshold_miles from nearest land. Uses spatial index for fast queries.';
+
+-- Batch spatial query function for checking all positions of a day at once
+-- This is 18-36x faster than calling is_at_sea() individually for each position
+create or replace function public.count_positions_near_land (
+  p_device_uid TEXT,
+  p_check_date DATE,
+  p_threshold_meters DOUBLE PRECISION
+) RETURNS INTEGER as $$
+DECLARE
+  near_land_count INTEGER;
+BEGIN
+  -- Count how many positions from this device on this date
+  -- are within threshold distance of land
+  SELECT COUNT(*) INTO near_land_count
+  FROM sensor_history sh
+  WHERE sh.device_uid = p_device_uid
+    AND sh.timestamp::date = p_check_date
+    AND sh.lat_avg IS NOT NULL
+    AND sh.lon_avg IS NOT NULL
+    AND EXISTS (
+      -- Check if this position is within threshold of ANY land polygon
+      SELECT 1
+      FROM land_polygons lp
+      WHERE ST_Distance(
+        ST_SetSRID(ST_MakePoint(sh.lon_avg, sh.lat_avg), 4326)::geography,
+        lp.geom::geography
+      ) < p_threshold_meters
+      -- Use spatial index to quickly find nearby polygons
+      AND lp.geom && ST_Expand(ST_SetSRID(ST_MakePoint(sh.lon_avg, sh.lat_avg), 4326), 1)
+      LIMIT 1
+    );
+  
+  RETURN near_land_count;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT on FUNCTION public.count_positions_near_land is 'Returns count of GPS positions within threshold_meters of land for a device on a specific date. Returns 0 if all positions are at sea. Used by chrono for batch checking.';
+
+-- Leaderboard helper functions for at-sea statistics
+create or replace function public.total_days_at_sea () RETURNS BIGINT as $$
+  SELECT COALESCE(SUM(days_at_sea_alltime), 0)
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+COMMENT on FUNCTION public.total_days_at_sea is 'Total cumulative days at sea across all devices in the fleet';
+
+create or replace function public.longest_active_streak () RETURNS INTEGER as $$
+  SELECT COALESCE(MAX(current_streak_days), 0)
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+COMMENT on FUNCTION public.longest_active_streak is 'Longest currently active at-sea streak across all devices';
+
+create or replace function public.longest_streak_ever () RETURNS INTEGER as $$
+  SELECT COALESCE(MAX(longest_streak_days), 0)
+  FROM public.device_statistics;
+$$ LANGUAGE SQL STABLE;
+
+COMMENT on FUNCTION public.longest_streak_ever is 'Longest at-sea streak ever recorded across all devices';
+
+-- ============================================
+-- STEP 7: Comments / Docs
+COMMENT on table public.devices is 'Links device UID to authenticated user and stores auth token';
+
+COMMENT on table public.user_profiles is 'Boat and owner info (username is public display name)';
+
+COMMENT on table public.device_statistics is 'Leaderboard and summary statistics';
+
+COMMENT on table public.sensor_history is 'Time-series telemetry written and read exclusively through Edge Functions (service_role bypasses RLS; anon blocked)';
+
+COMMENT on table public.orders is 'Stripe checkout sessions - one record per order';
+
+COMMENT on table public.order_items is 'Individual devices in each order - links Stripe line items to ESP32 MAC addresses';
+
+COMMENT on table public.stripe_webhook_events is 'Webhook event log for debugging and idempotency checking';
+
+COMMENT on table public.device_config_snapshots is 'Periodic config snapshots with explicit columns for fast querying - all device settings and learning table state';
+
+COMMENT on column public.sensor_history.batt_volt_min is 'Battery voltage minimum (V) over window';
+
+COMMENT on column public.sensor_history.batt_volt_max is 'Battery voltage maximum (V) over window';
+
+COMMENT on column public.sensor_history.batt_volt_avg is 'Battery voltage average (V) over window';
+
+COMMENT on column public.sensor_history.alt_curr_min is 'Alternator current minimum (A) over window';
+
+COMMENT on column public.sensor_history.alt_curr_max is 'Alternator current maximum (A) over window';
+
+COMMENT on column public.sensor_history.alt_curr_avg is 'Alternator current average (A) over window';
+
+COMMENT on column public.sensor_history.intended_interval_sec is 'Intended upload interval in seconds (float) reported by device for gap detection';
+
+COMMENT on column public.sensor_history.u_target_amps_min is 'Target current setpoint minimum (A) - what PID is trying to achieve';
+
+COMMENT on column public.sensor_history.u_target_amps_max is 'Target current setpoint maximum (A) - what PID is trying to achieve';
+
+COMMENT on column public.sensor_history.u_target_amps_avg is 'Target current setpoint average (A) - what PID is trying to achieve';
+
+COMMENT on column public.sensor_history.temp_margin_min is 'Temperature margin minimum (°F) - distance below temperature limit (negative = overheating)';
+
+COMMENT on column public.sensor_history.temp_margin_max is 'Temperature margin maximum (°F) - distance below temperature limit (negative = overheating)';
+
+COMMENT on column public.sensor_history.temp_margin_avg is 'Temperature margin average (°F) - distance below temperature limit (negative = overheating)';
+
+COMMENT on column public.sensor_history.total_overheats is 'Cumulative count of overheat events across all RPM ranges since learning table reset';
+
+COMMENT on column public.sensor_history.total_safe_hours is 'Cumulative hours of safe operation (no overheats) for learning confidence metric';
+
+COMMENT on column public.orders.internal_notes is 'Admin notes about order (manual entry via SQL)';
+
+COMMENT on column public.order_items.device_uid is 'ESP32 MAC address - manually linked after order placed';
+
+COMMENT on column public.order_items.registered_user_email is 'Email used when customer registered device (may differ from Stripe email)';
+
+COMMENT on column public.sensor_history.buffered_uploads_remaining is 'Number of uploads still in device buffer - used to determine if streak calculations should wait';
+
+COMMENT on column public.device_statistics.days_at_sea_alltime is 'Total number of days device has been >0.5 miles from land with sufficient GPS data';
+
+COMMENT on column public.device_statistics.current_streak_days is 'Current consecutive days at sea (resets to 0 when near land)';
+
+COMMENT on column public.device_statistics.longest_streak_days is 'Longest consecutive days at sea ever achieved by this device';
+
+COMMENT on column public.device_statistics.last_position_check_date is 'Last date that at-sea status was checked (YYYY-MM-DD format)';
