@@ -1,4 +1,4 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
 /*
 ================================================================================
 FORCED UPDATE ROLLOUT SQL DOCUMENTATION
@@ -152,7 +152,7 @@ WHERE
 ORDER BY forced_update_deadline ASC;
 
 ================================================================================
-*/ serve(async (req)=>{
+*/ Deno.serve(async (req)=>{
   return new Response(JSON.stringify({
     error: "This function is documentation-only. Run SQL queries directly in Supabase SQL Editor.",
     note: "See function source code for SQL query templates"

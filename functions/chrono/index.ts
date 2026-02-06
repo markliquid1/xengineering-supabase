@@ -1,4 +1,4 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.3';
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -8,7 +8,7 @@ const corsHeaders = {
 const UPLOADS_PER_DAY_REQUIRED = 120; // 10 min intervals over 20 hours
 const MILES_FROM_LAND_THRESHOLD = 0.5;
 const MOVEMENT_THRESHOLD_NM = 2.0; // Minimum distance to count as "moving day"
-serve(async (req)=>{
+Deno.serve(async (req)=>{
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response('ok', {
