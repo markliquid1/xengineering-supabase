@@ -64,9 +64,17 @@ Deno.serve(async (req)=>{
       }
     });
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Full error object:', JSON.stringify(error, null, 2));
+    console.error('Error details:', {
+      message: error.message,
+      hint: error.hint,
+      details: error.details,
+      code: error.code
+    });
     return new Response(JSON.stringify({
-      error: error.message
+      error: error.message,
+      hint: error.hint,
+      details: error.details
     }), {
       status: 500,
       headers: {
