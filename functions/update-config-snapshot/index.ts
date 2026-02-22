@@ -139,7 +139,7 @@ Deno.serve(async (req)=>{
       pid_kp: data.pid_kp ?? null,
       pid_ki: data.pid_ki ?? null,
       pid_kd: data.pid_kd ?? null,
-      pid_sample_time: data.pid_sample_time ?? null,
+      pid_sample_divisor: data.pid_sample_divisor ?? null,
       max_penalty_percent: data.max_penalty_percent ?? null,
       max_penalty_duration: data.max_penalty_duration ?? null,
       // Learning Diagnostics

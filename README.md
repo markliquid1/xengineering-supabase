@@ -77,7 +77,7 @@ Step 2 — Save changes to GitHub
 cd "/Users/joeceo/Projects/Cloud Workspace/supabase"
 
 git add -A
-git commit -m "Describe change"
+git commit -m "better debug error messages"
 git push
 
 This step is ONLY for backup and version history.
@@ -86,7 +86,7 @@ This step is ONLY for backup and version history.
 
 Step 3 — Deploy to Supabase (make it live)
 
-supabase functions deploy validate-token --use-docker
+supabase functions deploy get-fleet-stats --use-docker
 
 Replace "validate-token" with whichever function you edited.
 
